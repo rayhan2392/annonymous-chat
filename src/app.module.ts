@@ -1,15 +1,15 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { DatabaseModule } from './database/database.module';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
+import { RedisModule } from './redis/redis.module';
+import { AuthModule } from './auth/auth.module'; // <-- Is this imported?
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }), // Loads the .env file
+    ConfigModule.forRoot({ isGlobal: true }),
     DatabaseModule,
+    RedisModule,
+    AuthModule, // <-- Is it right here in this array?
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}
