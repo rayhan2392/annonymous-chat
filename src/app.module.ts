@@ -4,6 +4,7 @@ import { DatabaseModule } from './database/database.module';
 import { RedisModule } from './redis/redis.module';
 import { AuthModule } from './auth/auth.module'; // <-- Is this imported?
 import { RoomsModule } from './rooms/rooms.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -11,7 +12,8 @@ import { RoomsModule } from './rooms/rooms.module';
     DatabaseModule,
     RedisModule,
     AuthModule,
-    RoomsModule, // <-- Is it right here in this array?
+    RoomsModule,
+    ChatModule, // <-- Is it right here in this array?
   ],
 })
 export class AppModule {}

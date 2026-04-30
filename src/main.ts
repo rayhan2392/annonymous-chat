@@ -3,6 +3,7 @@ import { AppModule } from './app.module';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { ValidationPipe } from '@nestjs/common';
+import { RedisIoAdapter } from './redis-io.adapter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -17,8 +18,14 @@ async function bootstrap() {
   app.useGlobalInterceptors(new TransformInterceptor());
   app.useGlobalFilters(new AllExceptionsFilter());
 
-  await app.listen(3000);
-  console.log(`🚀 API is live at http://localhost:3000/api/v1`);
+  const redisIoAdapter = new RedisIoAdapter(app);
+  await redisIoAdapter.connectToRedis(process.env.REDIS_URL as string);
+  app.useWebSocketAdapter(redisIoAdapter);
+
+  const port = process.env.PORT || 3000;
+
+  await app.listen(port);
+  console.log(`🚀 API is live at http://localhost:${port}/api/v1`);
 }
 
 // Fixed "Floating Promise" error
