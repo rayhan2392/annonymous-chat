@@ -1,38 +1,111 @@
 # Architecture & Scaling Strategy
 
 ## Architecture Overview
-The application is decoupled into distinct layers to handle REST HTTP requests and real-time WebSocket connections independently, unified by Redis and PostgreSQL.
 
-* **Client -> REST API (`/api/v1`):** Handles authentication, room creation, and message persistence. Uses standard HTTP Request/Response cycles.
-* **Client -> WebSocket (`/chat`):** A strictly listen-only gateway (for messages) and connection state manager.
-* **PostgreSQL (via Drizzle ORM):** The source of truth for persistent data (Users, Rooms, Messages). 
-* **Redis:** Acts as the high-speed caching layer for sessions, active user sets, and the central message broker for Socket.io.
+The application is built with NestJS and uses distinct layers to handle REST HTTP requests and real-time WebSocket connections independently, unified by Redis and PostgreSQL via Drizzle ORM.
+
+- **Client -> REST API (`/api/v1`):** Handles authentication (`POST /login`), room management (`GET/POST/DELETE /rooms`), and message sending (`POST /rooms/:id/messages`). Uses standard HTTP Request/Response cycles with Bearer token validation.
+- **Client -> WebSocket (`/chat`):** Real-time event gateway for broadcasting messages and user presence updates to connected clients. Strictly read/subscribe model for message consumption.
+- **PostgreSQL (via Drizzle ORM):** Source of truth for persistent data:
+  - `users` table: user profiles with auto-generated IDs (`usr_*`)
+  - `rooms` table: chat rooms with creator tracking and cascade delete on messages
+  - `messages` table: message history with pagination support via cursor-based pagination
+- **Redis:** Three-tier usage:
+  - **Session Storage:** Bearer tokens map to user IDs with 24-hour TTL
+  - **Active User Tracking:** Redis Sets store connected usernames per room (`room:{roomId}:users`)
+  - **Pub/Sub Broker:** Central `chat-events` channel for cross-instance message broadcasting and room deletion events
 
 ## Session Strategy
-We implemented a passwordless, token-based authentication system.
-1. **Generation:** When a user logs in, a secure JWT/Opaque token is generated.
-2. **Storage:** The token is stored as a key in Redis with the `userId` as the value, featuring an explicit 24-hour expiration (TTL). 
-3. **Validation:** Every REST endpoint and WebSocket connection intercepts the request, grabs the Bearer token, and checks Redis. This completely bypasses the need to query PostgreSQL for authentication, resulting in sub-millisecond session validation.
 
-## WebSocket Fan-out via Redis Pub/Sub
-To scale across multiple server instances, no single instance can hold the "master" list of connected clients in local memory.
-1. When `POST /rooms/:id/messages` is called, Server A saves the message to PostgreSQL.
-2. Server A then publishes a `message:new` event to a central Redis `chat-events` channel.
-3. Every active server instance (Server A, Server B, Server C) subscribes to this Redis channel.
-4. When the Redis message is received, each server checks its local Socket.io memory to see if it holds any clients connected to that specific `roomId`, and broadcasts the message only to them.
+Passwordless, opaque token-based authentication system:
+
+1. **Generation:** `POST /login` with username creates or finds user and generates a 32-character opaque token via `nanoid(32)`.
+2. **Storage:** Token stored in Redis as `session:{token}` → `userId` with 86,400 second (24-hour) TTL.
+3. **Validation:** All protected REST endpoints use `AuthGuard` to validate Bearer token against Redis; WebSocket connections extract token from query parameters (`?token=...`) and validate before allowing room join.
+4. **Performance:** Session validation is sub-millisecond, completely bypassing PostgreSQL lookup.
+
+## Data Models
+
+- **Users:** `id` (PK: `usr_*`), `username` (unique, max 24 chars), `createdAt`
+- **Rooms:** `id` (PK: `room_*`), `name` (unique, max 32 chars), `createdBy` (userId), `createdAt`
+- **Messages:** `id` (PK: `msg_*`), `roomId` (FK with cascade delete), `username`, `content` (max 1000 chars), `createdAt`
+
+## WebSocket Event Flow & Redis Pub/Sub
+
+Implements a fan-out architecture to support horizontal scaling:
+
+### Message Broadcasting
+
+1. Client calls `POST /rooms/:id/messages` with message content.
+2. REST handler persists message to PostgreSQL via Drizzle ORM.
+3. Handler publishes event to Redis `chat-events` channel: `{ type: 'message:new', roomId, payload: message }`.
+4. Every active server instance's gateway subscribes to `chat-events`.
+5. On receiving message event, gateway broadcasts to local Socket.io clients in `roomId` via `server.to(roomId).emit('message:new', payload)`.
+
+### Room Deletion Flow
+
+1. `DELETE /rooms/:id` deletes room and cascades message deletion in PostgreSQL.
+2. Handler publishes `{ type: 'room:deleted', roomId }` to Redis.
+3. All gateway instances receive event and:
+   - Emit `room:deleted` event to clients in that room
+   - Force disconnect all clients in the room via `disconnectSockets()`
+
+### Presence Management
+
+- **Join:** Client connects to `/chat?token=X&roomId=Y`, gateway adds username to `room:{roomId}:users` Redis Set, emits `room:joined` (to joining client) and `room:user_joined` (broadcast to others).
+- **Leave:** On disconnect, gateway removes username from Set and broadcasts `room:user_left` with updated active users list.
+- **Active Count:** GET `/rooms/:id` returns active user count by calling `SCARD room:{roomId}:users`.
+
+## Message Pagination
+
+`GET /rooms/:id/messages` implements cursor-based pagination:
+
+- Default limit: 50 messages (max: 100)
+- Optional `before` query parameter for cursor
+- Returns messages in chronological order (oldest first) plus `hasMore` and `nextCursor` for client pagination
+
+## WebSocket Events Contract
+
+**Client to Server:**
+
+- `room:leave` - Gracefully disconnect from room (triggers `handleDisconnect`)
+
+**Server to Client:**
+
+- `room:joined` - Sent on successful connection, includes active users list
+- `room:user_joined` - Broadcast when another user joins
+- `room:user_left` - Broadcast when user disconnects
+- `message:new` - New message in room (via Redis Pub/Sub)
+- `room:deleted` - Room was deleted, clients forcefully disconnected
+- `error` - Authentication or room validation failures
 
 ## Estimated Concurrent User Capacity (Single Instance)
-Assuming a standard 1vCPU / 512MB RAM instance (e.g., Render Free/Hobby tier):
-* **Memory constraints:** Each active Socket.io connection uses roughly 30-50KB of RAM. 
-* **Capacity:** A single 512MB instance could safely maintain **~5,000 to 8,000 concurrent WebSocket connections** before memory pressure causes garbage collection lag.
-* **Bottleneck:** The bottleneck would not be the database (since writes are quick and reads are paginated), but rather Node.js CPU thread blocking during mass-broadcast serialization if thousands of users are in the *same* room sending messages simultaneously.
 
-## Scaling to 10x Load
-If the application needed to support 50,000 - 100,000 concurrent users, I would implement the following:
-1. **Horizontal Pod Autoscaling:** Spin up 5-10 Node.js instances behind a load balancer with sticky sessions disabled (since Redis handles our state).
-2. **PostgreSQL Connection Pooling:** Implement PgBouncer to prevent our horizontal scaling from exhausting the database connection limit.
-3. **Message Queueing:** Instead of writing to PostgreSQL synchronously during the REST request, I would push incoming messages to a Redis Stream or RabbitMQ/Kafka, and have a separate background worker batch-insert them into PostgreSQL. This keeps the REST endpoint response time completely flat regardless of database load.
+Assuming a standard 1vCPU / 512MB RAM instance:
+
+- **Memory constraints:** Each active Socket.io connection uses ~30-50KB of RAM.
+- **Capacity:** A single 512MB instance could safely maintain **~5,000 to 8,000 concurrent WebSocket connections** before memory pressure triggers garbage collection lag.
+- **Primary bottleneck:** Node.js CPU thread blocking during mass serialization if thousands of users in the _same_ room send messages simultaneously; Redis Pub/Sub can handle event volume, but Socket.io broadcasting becomes CPU-bound.
+- **Secondary bottleneck:** PostgreSQL connection pool exhaustion if configured too low; pooling via PgBouncer or built-in connection limits prevents database overload.
+
+## Scaling to 10x Load (50K-100K Concurrent Users)
+
+Recommended architecture changes:
+
+1. **Horizontal Pod Autoscaling:** Deploy 5-10 NestJS instances behind a load balancer. No sticky sessions required (Redis handles all state).
+2. **Redis Pub/Sub Adapter:** Already implemented via `@socket.io/redis-adapter`; Socket.io uses Redis for inter-instance communication.
+3. **PostgreSQL Connection Pooling:** Implement PgBouncer in transaction mode to pool connections and prevent connection exhaustion.
+4. **Message Queueing (Optional):** For extreme scale, instead of synchronous REST message inserts:
+   - Push messages to Redis Stream or RabbitMQ queue from REST handler
+   - Background worker (separate process) batch-inserts to PostgreSQL
+   - Keeps REST response time flat regardless of database load
+5. **Database Read Replicas:** If read load becomes bottleneck, add PostgreSQL replicas for message history queries.
 
 ## Known Limitations & Trade-offs
-* **REST for Sending Messages:** Forcing users to use `POST` for sending messages instead of emitting directly via WebSockets introduces slight HTTP overhead (headers, SSL handshakes) per message compared to a pure full-duplex socket channel. This was a deliberate trade-off to enforce strict REST API contract compliance.
-* **Orphaned Room Counts:** If a server crashes abruptly without running its `handleDisconnect` lifecycle hook, the user's name might remain stuck in the Redis Set for that room's active users. A cron job or TTL-based heartbeat mechanism would be needed in production to clean up "ghost" users in Redis.
+
+- **REST for Sending Messages:** `POST /rooms/:id/messages` enforces HTTP overhead (headers, SSL handshake, JSON serialization) per message vs. direct WebSocket emit. Deliberate trade-off to maintain strict REST API contract.
+- **Orphaned Room Active Users:** If a server crashes without graceful shutdown, usernames remain in Redis `room:{roomId}:users` Sets. No automatic cleanup exists. Production solution: implement cron job to TTL these keys or use Redis key expiration patterns.
+- **Message Content Validation:** Message length capped at 1000 characters; no rich text, markdown, or inline media support.
+- **Username Immutability:** Usernames are permanent after creation; no edit or delete capability for user profiles.
+- **Room Naming Collision:** Room names are globally unique; no namespacing or user-owned room separation.
+- **No Message Editing:** Messages are immutable after creation; only deletion via room deletion cascade.
